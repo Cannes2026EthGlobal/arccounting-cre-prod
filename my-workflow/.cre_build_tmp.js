@@ -16536,24 +16536,41 @@ function getArrayComponents(type) {
 var configSchema = exports_external.object({
   schedule: exports_external.string(),
   payrollContractAddress: exports_external.string(),
-  recipientAddress: exports_external.string(),
-  amount: exports_external.string(),
+  convexUrl: exports_external.string(),
   chainSelectorName: exports_external.string(),
   gasLimit: exports_external.string()
 });
-var triggerPayment = (runtime2) => {
-  const { payrollContractAddress, recipientAddress, amount, chainSelectorName, gasLimit } = runtime2.config;
-  const network282 = getNetwork({
-    chainFamily: "evm",
-    chainSelectorName,
-    isTestnet: true
-  });
+var fetchPaychecks = (runtime2) => {
+  const httpCapability = new cre.capabilities.ConfidentialHTTPClient;
+  const res = httpCapability.sendRequest(runtime2, {
+    request: {
+      method: "POST",
+      url: `${runtime2.config.convexUrl}/api/query`,
+      multiHeaders: {
+        "Content-Type": { values: ["application/json"] }
+      },
+      bodyString: JSON.stringify({ path: "paychecks:list", args: {} })
+    }
+  }).result();
+  if (res.statusCode !== 200) {
+    throw new Error(`Convex query failed: HTTP ${res.statusCode}`);
+  }
+  const text = new TextDecoder().decode(res.body);
+  const data = JSON.parse(text);
+  if (data.status !== "success") {
+    throw new Error(`Convex error: ${JSON.stringify(data)}`);
+  }
+  return data.value;
+};
+var sendPayment = (runtime2, paycheck) => {
+  const { payrollContractAddress, chainSelectorName, gasLimit } = runtime2.config;
+  const network282 = getNetwork({ chainFamily: "evm", chainSelectorName, isTestnet: true });
   if (!network282)
     throw new Error(`Unknown network: ${chainSelectorName}`);
   const evmClient = new cre.capabilities.EVMClient(network282.chainSelector.selector);
-  const amountBigInt = BigInt(amount);
-  runtime2.log(`Paying ${recipientAddress} → ${amountBigInt} wei (${Number(amountBigInt) / 1000000000000000000} USDC)`);
-  const encoded = encodeAbiParameters(parseAbiParameters("address, uint256"), [recipientAddress, amountBigInt]);
+  const amountWei = BigInt(Math.round(paycheck.Amount * 1000000000000000000));
+  runtime2.log(`Paying ${paycheck.Recepient} → ${paycheck.Amount} USDC (${amountWei} wei)`);
+  const encoded = encodeAbiParameters(parseAbiParameters("address, uint256"), [paycheck.Recepient, amountWei]);
   const report2 = runtime2.report(prepareReportRequest(encoded)).result();
   const result = evmClient.writeReport(runtime2, {
     receiver: payrollContractAddress,
@@ -16561,15 +16578,25 @@ var triggerPayment = (runtime2) => {
     gasConfig: { gasLimit: gasLimit.toString() }
   }).result();
   if (result.txStatus !== TxStatus.SUCCESS) {
-    throw new Error(`Payment failed: ${result.errorMessage ?? result.txStatus}`);
+    throw new Error(`Payment failed for ${paycheck.Recepient}: ${result.errorMessage ?? result.txStatus}`);
   }
   const txHash = bytesToHex(result.txHash ?? new Uint8Array(32));
-  runtime2.log(`Payment sent! txHash: ${txHash}`);
-  return `Paid ${Number(amountBigInt) / 1000000000000000000} USDC to ${recipientAddress} — ${txHash}`;
+  runtime2.log(`Paid ${paycheck.Amount} USDC to ${paycheck.Recepient} — ${txHash}`);
+  return txHash;
 };
 var onCronTrigger = (runtime2, _payload) => {
-  runtime2.log("Payroll trigger fired");
-  return triggerPayment(runtime2);
+  runtime2.log("Payroll trigger fired — fetching paychecks from Convex...");
+  const paychecks = fetchPaychecks(runtime2);
+  runtime2.log(`Found ${paychecks.length} paycheck(s)`);
+  if (paychecks.length === 0) {
+    return "No paychecks to process";
+  }
+  const results = [];
+  for (const paycheck of paychecks) {
+    const txHash = sendPayment(runtime2, paycheck);
+    results.push(`${paycheck.Recepient}:${paycheck.Amount}USDC:${txHash}`);
+  }
+  return `Processed ${results.length} payment(s): ${results.join(", ")}`;
 };
 function initWorkflow(config) {
   const cronCapability = new cre.capabilities.CronCapability;

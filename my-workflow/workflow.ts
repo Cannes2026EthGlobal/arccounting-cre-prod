@@ -15,59 +15,85 @@ import { z } from 'zod'
 // ---------------------------------------------------------------------------
 
 export const configSchema = z.object({
-  // Cron expression — how often to run. "*/30 * * * * *" = every 30 seconds.
   schedule: z.string(),
-
-  // Address of the deployed Payroll contract on ARC testnet
   payrollContractAddress: z.string(),
-
-  // Recipient address to receive the payment
-  recipientAddress: z.string(),
-
-  // Payment amount in wei (USDC on ARC has 18 decimals, so 1e18 = 1 USDC)
-  amount: z.string(),
-
-  // Chain selector name — "arc-testnet"
+  convexUrl: z.string(),
   chainSelectorName: z.string(),
-
-  // Gas limit for the on-chain write transaction
   gasLimit: z.string(),
 })
 
 export type Config = z.infer<typeof configSchema>
 
 // ---------------------------------------------------------------------------
-// TRIGGER PAYMENT
+// CONVEX TYPES
 // ---------------------------------------------------------------------------
-// Encodes (recipient, amount) and submits to Payroll via the CRE Forwarder.
-//
-//   CRE workflow
-//       └── evmClient.writeReport()
-//               ▼
-//       KeystoneForwarder (verifies DON signatures)
-//               ▼
-//       Payroll._processReport()  →  recipient.call{value: amount}("")
 
-const triggerPayment = (runtime: Runtime<Config>): string => {
-  const { payrollContractAddress, recipientAddress, amount, chainSelectorName, gasLimit } = runtime.config
+interface Paycheck {
+  _id: string
+  Amount: number      // float64, e.g. 1.5 = 1.5 USDC
+  Recepient: string   // wallet address
+}
 
-  const network = getNetwork({
-    chainFamily: 'evm',
-    chainSelectorName,
-    isTestnet: true,
-  })
+interface ConvexResponse {
+  status: string
+  value: Paycheck[]
+}
+
+// ---------------------------------------------------------------------------
+// FETCH PAYCHECKS FROM CONVEX
+// ---------------------------------------------------------------------------
+
+const fetchPaychecks = (runtime: Runtime<Config>): Paycheck[] => {
+  const httpCapability = new cre.capabilities.ConfidentialHTTPClient()
+
+  const res = httpCapability.sendRequest(runtime, {
+    request: {
+      method: 'POST',
+      url: `${runtime.config.convexUrl}/api/query`,
+      multiHeaders: {
+        'Content-Type': { values: ['application/json'] },
+      },
+      bodyString: JSON.stringify({ path: 'paychecks:list', args: {} }),
+    },
+  }).result()
+
+  if (res.statusCode !== 200) {
+    throw new Error(`Convex query failed: HTTP ${res.statusCode}`)
+  }
+
+  const text = new TextDecoder().decode(res.body)
+  const data: ConvexResponse = JSON.parse(text)
+
+  if (data.status !== 'success') {
+    throw new Error(`Convex error: ${JSON.stringify(data)}`)
+  }
+
+  return data.value
+}
+
+// ---------------------------------------------------------------------------
+// TRIGGER A SINGLE PAYMENT
+// ---------------------------------------------------------------------------
+
+const sendPayment = (
+  runtime: Runtime<Config>,
+  paycheck: Paycheck,
+): string => {
+  const { payrollContractAddress, chainSelectorName, gasLimit } = runtime.config
+
+  const network = getNetwork({ chainFamily: 'evm', chainSelectorName, isTestnet: true })
   if (!network) throw new Error(`Unknown network: ${chainSelectorName}`)
 
   const evmClient = new cre.capabilities.EVMClient(network.chainSelector.selector)
 
-  const amountBigInt = BigInt(amount)
+  // Amount is in USDC (float), convert to wei (18 decimals)
+  const amountWei = BigInt(Math.round(paycheck.Amount * 1e18))
 
-  runtime.log(`Paying ${recipientAddress} → ${amountBigInt} wei (${Number(amountBigInt) / 1e18} USDC)`)
+  runtime.log(`Paying ${paycheck.Recepient} → ${paycheck.Amount} USDC (${amountWei} wei)`)
 
-  // ABI-encode (address recipient, uint256 amount) — matches Payroll._processReport decode
   const encoded = encodeAbiParameters(
     parseAbiParameters('address, uint256'),
-    [recipientAddress as `0x${string}`, amountBigInt],
+    [paycheck.Recepient as `0x${string}`, amountWei],
   )
 
   const report = runtime.report(prepareReportRequest(encoded)).result()
@@ -79,13 +105,12 @@ const triggerPayment = (runtime: Runtime<Config>): string => {
   }).result()
 
   if (result.txStatus !== TxStatus.SUCCESS) {
-    throw new Error(`Payment failed: ${result.errorMessage ?? result.txStatus}`)
+    throw new Error(`Payment failed for ${paycheck.Recepient}: ${result.errorMessage ?? result.txStatus}`)
   }
 
   const txHash = bytesToHex(result.txHash ?? new Uint8Array(32))
-  runtime.log(`Payment sent! txHash: ${txHash}`)
-
-  return `Paid ${Number(amountBigInt) / 1e18} USDC to ${recipientAddress} — ${txHash}`
+  runtime.log(`Paid ${paycheck.Amount} USDC to ${paycheck.Recepient} — ${txHash}`)
+  return txHash
 }
 
 // ---------------------------------------------------------------------------
@@ -93,8 +118,22 @@ const triggerPayment = (runtime: Runtime<Config>): string => {
 // ---------------------------------------------------------------------------
 
 export const onCronTrigger = (runtime: Runtime<Config>, _payload: CronPayload): string => {
-  runtime.log('Payroll trigger fired')
-  return triggerPayment(runtime)
+  runtime.log('Payroll trigger fired — fetching paychecks from Convex...')
+
+  const paychecks = fetchPaychecks(runtime)
+  runtime.log(`Found ${paychecks.length} paycheck(s)`)
+
+  if (paychecks.length === 0) {
+    return 'No paychecks to process'
+  }
+
+  const results: string[] = []
+  for (const paycheck of paychecks) {
+    const txHash = sendPayment(runtime, paycheck)
+    results.push(`${paycheck.Recepient}:${paycheck.Amount}USDC:${txHash}`)
+  }
+
+  return `Processed ${results.length} payment(s): ${results.join(', ')}`
 }
 
 // ---------------------------------------------------------------------------
