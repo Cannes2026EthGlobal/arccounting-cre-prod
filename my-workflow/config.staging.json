@@ -1,7 +1,7 @@
 {
   "schedule": "*/30 * * * * *",
   "payrollContractAddress": "0xb2C0CBFc616199509AA0a890782c81772Bf632E1",
-  "convexUrl": "https://reliable-cow-820.eu-west-1.convex.cloud",
+  "convexUrl": "https://canny-dogfish-590.eu-west-1.convex.cloud",
   "chainSelectorName": "arc-testnet",
   "gasLimit": "500000"
 }

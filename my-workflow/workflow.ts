@@ -28,22 +28,26 @@ export type Config = z.infer<typeof configSchema>
 // CONVEX TYPES
 // ---------------------------------------------------------------------------
 
-interface Paycheck {
+interface Request {
   _id: string
-  Amount: number      // float64, e.g. 1.5 = 1.5 USDC
-  Recepient: string   // wallet address
+  employeeId: string
+  amount: number             // float64 USDC
+  recipientAddress: string   // payment destination
+  scheduledDate: number      // ms timestamp
+  status: 'pending' | 'paid' | 'rejected'
+  txHash?: string
 }
 
-interface ConvexResponse {
+interface ConvexQueryResponse<T> {
   status: string
-  value: Paycheck[]
+  value: T
 }
 
 // ---------------------------------------------------------------------------
-// FETCH PAYCHECKS FROM CONVEX
+// FETCH DUE REQUESTS FROM CONVEX
 // ---------------------------------------------------------------------------
 
-const fetchPaychecks = (runtime: Runtime<Config>): Paycheck[] => {
+const fetchDueRequests = (runtime: Runtime<Config>): Request[] => {
   const httpCapability = new cre.capabilities.ConfidentialHTTPClient()
 
   const res = httpCapability.sendRequest(runtime, {
@@ -53,16 +57,16 @@ const fetchPaychecks = (runtime: Runtime<Config>): Paycheck[] => {
       multiHeaders: {
         'Content-Type': { values: ['application/json'] },
       },
-      bodyString: JSON.stringify({ path: 'paychecks:list', args: {} }),
+      bodyString: JSON.stringify({ path: 'requests:getDueRequests', args: {} }),
     },
   }).result()
 
   if (res.statusCode !== 200) {
-    throw new Error(`Convex query failed: HTTP ${res.statusCode}`)
+    throw new Error(`Convex getDueRequests failed: HTTP ${res.statusCode}`)
   }
 
   const text = new TextDecoder().decode(res.body)
-  const data: ConvexResponse = JSON.parse(text)
+  const data: ConvexQueryResponse<Request[]> = JSON.parse(text)
 
   if (data.status !== 'success') {
     throw new Error(`Convex error: ${JSON.stringify(data)}`)
@@ -72,12 +76,64 @@ const fetchPaychecks = (runtime: Runtime<Config>): Paycheck[] => {
 }
 
 // ---------------------------------------------------------------------------
+// MARK A REQUEST AS FULFILLED IN CONVEX
+// ---------------------------------------------------------------------------
+
+/**
+ * Calls the Convex `requests:fulfillRequest` mutation to atomically mark
+ * the request as paid and increment the employee's totalPaid counter.
+ *
+ * This is called AFTER a successful on-chain payment. If the mutation fails,
+ * we log a warning but do NOT throw — the on-chain payment is irreversible
+ * and the request will be retried on the next cron cycle (the mutation's
+ * idempotency guard prevents double-payment).
+ */
+const fulfillRequest = (
+  runtime: Runtime<Config>,
+  requestId: string,
+  txHash: string,
+): void => {
+  const httpCapability = new cre.capabilities.ConfidentialHTTPClient()
+
+  const res = httpCapability.sendRequest(runtime, {
+    request: {
+      method: 'POST',
+      url: `${runtime.config.convexUrl}/api/mutation`,
+      multiHeaders: {
+        'Content-Type': { values: ['application/json'] },
+      },
+      bodyString: JSON.stringify({
+        path: 'requests:fulfillRequest',
+        args: { requestId, txHash },
+      }),
+    },
+  }).result()
+
+  if (res.statusCode !== 200) {
+    runtime.log(
+      `WARNING: fulfillRequest mutation failed for requestId=${requestId} txHash=${txHash}. ` +
+      `HTTP ${res.statusCode}. Request stays pending — will retry next cycle.`,
+    )
+    return
+  }
+
+  const text = new TextDecoder().decode(res.body)
+  const data = JSON.parse(text)
+  if (data.status !== 'success') {
+    runtime.log(
+      `WARNING: fulfillRequest returned non-success for requestId=${requestId}: ` +
+      `${JSON.stringify(data)}`,
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // TRIGGER A SINGLE PAYMENT
 // ---------------------------------------------------------------------------
 
 const sendPayment = (
   runtime: Runtime<Config>,
-  paycheck: Paycheck,
+  request: Request,
 ): string => {
   const { payrollContractAddress, chainSelectorName, gasLimit } = runtime.config
 
@@ -87,13 +143,16 @@ const sendPayment = (
   const evmClient = new cre.capabilities.EVMClient(network.chainSelector.selector)
 
   // Amount is in USDC (float), convert to wei (18 decimals)
-  const amountWei = BigInt(Math.round(paycheck.Amount * 1e18))
+  const amountWei = BigInt(Math.round(request.amount * 1e18))
 
-  runtime.log(`Paying ${paycheck.Recepient} → ${paycheck.Amount} USDC (${amountWei} wei)`)
+  runtime.log(
+    `Paying ${request.recipientAddress} → ${request.amount} USDC (${amountWei} wei) ` +
+    `[requestId: ${request._id}]`,
+  )
 
   const encoded = encodeAbiParameters(
     parseAbiParameters('address, uint256'),
-    [paycheck.Recepient as `0x${string}`, amountWei],
+    [request.recipientAddress as `0x${string}`, amountWei],
   )
 
   const report = runtime.report(prepareReportRequest(encoded)).result()
@@ -105,11 +164,16 @@ const sendPayment = (
   }).result()
 
   if (result.txStatus !== TxStatus.SUCCESS) {
-    throw new Error(`Payment failed for ${paycheck.Recepient}: ${result.errorMessage ?? result.txStatus}`)
+    throw new Error(
+      `Payment failed for ${request.recipientAddress}: ` +
+      `${result.errorMessage ?? result.txStatus}`,
+    )
   }
 
   const txHash = bytesToHex(result.txHash ?? new Uint8Array(32))
-  runtime.log(`Paid ${paycheck.Amount} USDC to ${paycheck.Recepient} — ${txHash}`)
+  runtime.log(
+    `Paid ${request.amount} USDC to ${request.recipientAddress} — txHash: ${txHash}`,
+  )
   return txHash
 }
 
@@ -118,22 +182,35 @@ const sendPayment = (
 // ---------------------------------------------------------------------------
 
 export const onCronTrigger = (runtime: Runtime<Config>, _payload: CronPayload): string => {
-  runtime.log('Payroll trigger fired — fetching paychecks from Convex...')
+  runtime.log('Payroll trigger fired — fetching due requests from Convex...')
 
-  const paychecks = fetchPaychecks(runtime)
-  runtime.log(`Found ${paychecks.length} paycheck(s)`)
+  const requests = fetchDueRequests(runtime)
+  runtime.log(`Found ${requests.length} due request(s)`)
 
-  if (paychecks.length === 0) {
-    return 'No paychecks to process'
+  if (requests.length === 0) {
+    return 'No due requests to process'
   }
 
   const results: string[] = []
-  for (const paycheck of paychecks) {
-    const txHash = sendPayment(runtime, paycheck)
-    results.push(`${paycheck.Recepient}:${paycheck.Amount}USDC:${txHash}`)
+  const failures: string[] = []
+
+  for (const request of requests) {
+    try {
+      const txHash = sendPayment(runtime, request)
+      fulfillRequest(runtime, request._id, txHash)
+      results.push(`${request.recipientAddress}:${request.amount}USDC:${txHash}`)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      runtime.log(`ERROR processing requestId=${request._id}: ${msg}`)
+      failures.push(`${request._id}:${msg}`)
+    }
   }
 
-  return `Processed ${results.length} payment(s): ${results.join(', ')}`
+  const summary = `Processed ${results.length} payment(s): ${results.join(', ')}`
+  if (failures.length > 0) {
+    return `${summary} | ${failures.length} failure(s): ${failures.join(', ')}`
+  }
+  return summary
 }
 
 // ---------------------------------------------------------------------------
