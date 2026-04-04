@@ -1,0 +1,7 @@
+{
+  "schedule": "*/30 * * * * *",
+  "apiUrl": "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+  "consumerAddress": "0xd58eA1B7B2639058F3F2F11a548Bb9f7aeF06D6C",
+  "chainSelectorName": "arc-testnet",
+  "gasLimit": "500000"
+}
