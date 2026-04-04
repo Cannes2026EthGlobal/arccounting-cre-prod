@@ -16535,25 +16535,24 @@ function getArrayComponents(type) {
 }
 var configSchema = exports_external.object({
   schedule: exports_external.string(),
-  payrollContractAddress: exports_external.string(),
   convexUrl: exports_external.string(),
   chainSelectorName: exports_external.string(),
   gasLimit: exports_external.string()
 });
-var fetchDueRequests = (runtime2) => {
-  const httpCapability = new cre.capabilities.ConfidentialHTTPClient;
-  const res = httpCapability.sendRequest(runtime2, {
+var fetchDueEmployees = (runtime2) => {
+  const http2 = new cre.capabilities.ConfidentialHTTPClient;
+  const res = http2.sendRequest(runtime2, {
     request: {
       method: "POST",
       url: `${runtime2.config.convexUrl}/api/query`,
       multiHeaders: {
         "Content-Type": { values: ["application/json"] }
       },
-      bodyString: JSON.stringify({ path: "requests:getDueRequests", args: {} })
+      bodyString: JSON.stringify({ path: "cre:getDueEmployees", args: {} })
     }
   }).result();
   if (res.statusCode !== 200) {
-    throw new Error(`Convex getDueRequests failed: HTTP ${res.statusCode}`);
+    throw new Error(`Convex getDueEmployees failed: HTTP ${res.statusCode}`);
   }
   const text = new TextDecoder().decode(res.body);
   const data = JSON.parse(text);
@@ -16562,9 +16561,9 @@ var fetchDueRequests = (runtime2) => {
   }
   return data.value;
 };
-var fulfillRequest = (runtime2, requestId, txHash) => {
-  const httpCapability = new cre.capabilities.ConfidentialHTTPClient;
-  const res = httpCapability.sendRequest(runtime2, {
+var markPaid = (runtime2, employeeId, txHash, amountCents, paidAt) => {
+  const http2 = new cre.capabilities.ConfidentialHTTPClient;
+  const res = http2.sendRequest(runtime2, {
     request: {
       method: "POST",
       url: `${runtime2.config.convexUrl}/api/mutation`,
@@ -16572,30 +16571,31 @@ var fulfillRequest = (runtime2, requestId, txHash) => {
         "Content-Type": { values: ["application/json"] }
       },
       bodyString: JSON.stringify({
-        path: "requests:fulfillRequest",
-        args: { requestId, txHash }
+        path: "cre:markPaid",
+        args: { employeeId, txHash, amountCents, paidAt }
       })
     }
   }).result();
   if (res.statusCode !== 200) {
-    runtime2.log(`WARNING: fulfillRequest mutation failed for requestId=${requestId} txHash=${txHash}. ` + `HTTP ${res.statusCode}. Request stays pending — will retry next cycle.`);
+    runtime2.log(`WARNING: markPaid failed for employeeId=${employeeId} txHash=${txHash}. ` + `HTTP ${res.statusCode}. nextPaymentDate not advanced — employee may be retried next cycle.`);
     return;
   }
   const text = new TextDecoder().decode(res.body);
   const data = JSON.parse(text);
   if (data.status !== "success") {
-    runtime2.log(`WARNING: fulfillRequest returned non-success for requestId=${requestId}: ` + `${JSON.stringify(data)}`);
+    runtime2.log(`WARNING: markPaid non-success for employeeId=${employeeId}: ${JSON.stringify(data)}`);
   }
 };
-var sendPayment = (runtime2, request) => {
-  const { payrollContractAddress, chainSelectorName, gasLimit } = runtime2.config;
+var sendPayment = (runtime2, employee) => {
+  const { chainSelectorName, gasLimit } = runtime2.config;
+  const { payrollContractAddress, walletAddress, amountCents, _id, companyId } = employee;
   const network282 = getNetwork({ chainFamily: "evm", chainSelectorName, isTestnet: true });
   if (!network282)
     throw new Error(`Unknown network: ${chainSelectorName}`);
   const evmClient = new cre.capabilities.EVMClient(network282.chainSelector.selector);
-  const amountWei = BigInt(Math.round(request.amount * 1000000000000000000));
-  runtime2.log(`Paying ${request.recipientAddress} → ${request.amount} USDC (${amountWei} wei) ` + `[requestId: ${request._id}]`);
-  const encoded = encodeAbiParameters(parseAbiParameters("address, uint256"), [request.recipientAddress, amountWei]);
+  const amountWei = BigInt(Math.round(amountCents / 100 * 1000000000000000000));
+  runtime2.log(`Paying ${walletAddress} → $${(amountCents / 100).toFixed(2)} USDC (${amountWei} wei) ` + `[employeeId: ${_id}] [companyId: ${companyId}] [contract: ${payrollContractAddress}]`);
+  const encoded = encodeAbiParameters(parseAbiParameters("address, uint256"), [walletAddress, amountWei]);
   const report2 = runtime2.report(prepareReportRequest(encoded)).result();
   const result = evmClient.writeReport(runtime2, {
     receiver: payrollContractAddress,
@@ -16603,30 +16603,31 @@ var sendPayment = (runtime2, request) => {
     gasConfig: { gasLimit: gasLimit.toString() }
   }).result();
   if (result.txStatus !== TxStatus.SUCCESS) {
-    throw new Error(`Payment failed for ${request.recipientAddress}: ` + `${result.errorMessage ?? result.txStatus}`);
+    throw new Error(`Payment failed for ${walletAddress}: ${result.errorMessage ?? result.txStatus}`);
   }
   const txHash = bytesToHex(result.txHash ?? new Uint8Array(32));
-  runtime2.log(`Paid ${request.amount} USDC to ${request.recipientAddress} — txHash: ${txHash}`);
+  runtime2.log(`Paid $${(amountCents / 100).toFixed(2)} USDC to ${walletAddress} — txHash: ${txHash}`);
   return txHash;
 };
 var onCronTrigger = (runtime2, _payload) => {
-  runtime2.log("Payroll trigger fired — fetching due requests from Convex...");
-  const requests = fetchDueRequests(runtime2);
-  runtime2.log(`Found ${requests.length} due request(s)`);
-  if (requests.length === 0) {
-    return "No due requests to process";
+  runtime2.log("Payroll trigger fired — fetching due employees from Convex...");
+  const employees = fetchDueEmployees(runtime2);
+  runtime2.log(`Found ${employees.length} due employee(s)`);
+  if (employees.length === 0) {
+    return "No due employees to pay today";
   }
   const results = [];
   const failures = [];
-  for (const request of requests) {
+  for (const employee of employees) {
     try {
-      const txHash = sendPayment(runtime2, request);
-      fulfillRequest(runtime2, request._id, txHash);
-      results.push(`${request.recipientAddress}:${request.amount}USDC:${txHash}`);
+      const paidAt = Date.now();
+      const txHash = sendPayment(runtime2, employee);
+      markPaid(runtime2, employee._id, txHash, employee.amountCents, paidAt);
+      results.push(`${employee.walletAddress}:$${(employee.amountCents / 100).toFixed(2)}:${txHash}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      runtime2.log(`ERROR processing requestId=${request._id}: ${msg}`);
-      failures.push(`${request._id}:${msg}`);
+      runtime2.log(`ERROR processing employeeId=${employee._id}: ${msg}`);
+      failures.push(`${employee._id}:${msg}`);
     }
   }
   const summary = `Processed ${results.length} payment(s): ${results.join(", ")}`;

@@ -1,7 +1,6 @@
 {
-  "schedule": "*/30 * * * * *",
-  "payrollContractAddress": "0xb2C0CBFc616199509AA0a890782c81772Bf632E1",
-  "convexUrl": "https://canny-dogfish-590.eu-west-1.convex.cloud",
+  "schedule": "0 9 * * *",
+  "convexUrl": "https://dashing-oriole-442.eu-west-1.convex.cloud",
   "chainSelectorName": "arc-testnet",
   "gasLimit": "500000"
 }
