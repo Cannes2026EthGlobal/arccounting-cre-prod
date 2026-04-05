@@ -1,6 +1,6 @@
 {
   "schedule": "0 9 * * *",
-  "convexUrl": "https://dashing-oriole-442.eu-west-1.convex.cloud",
+  "convexUrl": "https://proper-retriever-552.eu-west-1.convex.cloud",
   "chainSelectorName": "arc-testnet",
   "gasLimit": "500000"
 }

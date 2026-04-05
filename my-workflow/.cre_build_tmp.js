@@ -16539,7 +16539,7 @@ var configSchema = exports_external.object({
   chainSelectorName: exports_external.string(),
   gasLimit: exports_external.string()
 });
-var fetchDueEmployees = (runtime2) => {
+var fetchDuePayments = (runtime2) => {
   const http2 = new cre.capabilities.ConfidentialHTTPClient;
   const res = http2.sendRequest(runtime2, {
     request: {
@@ -16561,8 +16561,19 @@ var fetchDueEmployees = (runtime2) => {
   }
   return data.value;
 };
-var markPaid = (runtime2, employeeId, txHash, amountCents, paidAt) => {
+var markPaid = (runtime2, payment, txHash, paidAt) => {
   const http2 = new cre.capabilities.ConfidentialHTTPClient;
+  const args = {
+    employeeId: payment.employeeId,
+    compensationLineId: payment.compensationLineId,
+    walletAddress: payment.walletAddress,
+    txHash,
+    amountCents: payment.amountCents,
+    paidAt
+  };
+  if (payment.compensationSplitId) {
+    args.compensationSplitId = payment.compensationSplitId;
+  }
   const res = http2.sendRequest(runtime2, {
     request: {
       method: "POST",
@@ -16570,31 +16581,28 @@ var markPaid = (runtime2, employeeId, txHash, amountCents, paidAt) => {
       multiHeaders: {
         "Content-Type": { values: ["application/json"] }
       },
-      bodyString: JSON.stringify({
-        path: "cre:markPaid",
-        args: { employeeId, txHash, amountCents, paidAt }
-      })
+      bodyString: JSON.stringify({ path: "cre:markPaid", args })
     }
   }).result();
   if (res.statusCode !== 200) {
-    runtime2.log(`WARNING: markPaid failed for employeeId=${employeeId} txHash=${txHash}. ` + `HTTP ${res.statusCode}. nextPaymentDate not advanced — employee may be retried next cycle.`);
+    runtime2.log(`WARNING: markPaid failed for employeeId=${payment.employeeId} txHash=${txHash}. ` + `HTTP ${res.statusCode}. Payment may be retried next cycle.`);
     return;
   }
   const text = new TextDecoder().decode(res.body);
   const data = JSON.parse(text);
   if (data.status !== "success") {
-    runtime2.log(`WARNING: markPaid non-success for employeeId=${employeeId}: ${JSON.stringify(data)}`);
+    runtime2.log(`WARNING: markPaid non-success for employeeId=${payment.employeeId}: ${JSON.stringify(data)}`);
   }
 };
-var sendPayment = (runtime2, employee) => {
+var sendPayment = (runtime2, payment) => {
   const { chainSelectorName, gasLimit } = runtime2.config;
-  const { payrollContractAddress, walletAddress, amountCents, _id, companyId } = employee;
+  const { payrollContractAddress, walletAddress, amountCents, employeeId, companyId } = payment;
   const network282 = getNetwork({ chainFamily: "evm", chainSelectorName, isTestnet: true });
   if (!network282)
     throw new Error(`Unknown network: ${chainSelectorName}`);
   const evmClient = new cre.capabilities.EVMClient(network282.chainSelector.selector);
   const amountWei = BigInt(Math.round(amountCents / 100 * 1000000000000000000));
-  runtime2.log(`Paying ${walletAddress} → $${(amountCents / 100).toFixed(2)} USDC (${amountWei} wei) ` + `[employeeId: ${_id}] [companyId: ${companyId}] [contract: ${payrollContractAddress}]`);
+  runtime2.log(`Paying ${walletAddress} → $${(amountCents / 100).toFixed(2)} USDC (${amountWei} wei) ` + `[employeeId: ${employeeId}] [companyId: ${companyId}] [contract: ${payrollContractAddress}]`);
   const encoded = encodeAbiParameters(parseAbiParameters("address, uint256"), [walletAddress, amountWei]);
   const report2 = runtime2.report(prepareReportRequest(encoded)).result();
   const result = evmClient.writeReport(runtime2, {
@@ -16610,24 +16618,24 @@ var sendPayment = (runtime2, employee) => {
   return txHash;
 };
 var onCronTrigger = (runtime2, _payload) => {
-  runtime2.log("Payroll trigger fired — fetching due employees from Convex...");
-  const employees = fetchDueEmployees(runtime2);
-  runtime2.log(`Found ${employees.length} due employee(s)`);
-  if (employees.length === 0) {
-    return "No due employees to pay today";
+  runtime2.log("Payroll trigger fired — fetching due payments from Convex...");
+  const payments = fetchDuePayments(runtime2);
+  runtime2.log(`Found ${payments.length} due payment(s)`);
+  if (payments.length === 0) {
+    return "No due payments today";
   }
   const results = [];
   const failures = [];
-  for (const employee of employees) {
+  for (const payment of payments) {
     try {
       const paidAt = Date.now();
-      const txHash = sendPayment(runtime2, employee);
-      markPaid(runtime2, employee._id, txHash, employee.amountCents, paidAt);
-      results.push(`${employee.walletAddress}:$${(employee.amountCents / 100).toFixed(2)}:${txHash}`);
+      const txHash = sendPayment(runtime2, payment);
+      markPaid(runtime2, payment, txHash, paidAt);
+      results.push(`${payment.walletAddress}:$${(payment.amountCents / 100).toFixed(2)}:${txHash}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      runtime2.log(`ERROR processing employeeId=${employee._id}: ${msg}`);
-      failures.push(`${employee._id}:${msg}`);
+      runtime2.log(`ERROR processing employeeId=${payment.employeeId} (${payment.description}): ${msg}`);
+      failures.push(`${payment.employeeId}:${msg}`);
     }
   }
   const summary = `Processed ${results.length} payment(s): ${results.join(", ")}`;

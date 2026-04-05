@@ -27,13 +27,16 @@ export type Config = z.infer<typeof configSchema>
 // TYPES
 // ---------------------------------------------------------------------------
 
-interface DueEmployee {
-  _id:                    string
+interface DuePayment {
+  employeeId:             string
   walletAddress:          string
   amountCents:            number   // USDC cents, e.g. 100 = $1.00
   payrollContractAddress: string
   companyId:              string
   frequency:              string
+  compensationLineId:     string
+  compensationSplitId?:   string
+  description:            string
 }
 
 interface ConvexQueryResponse<T> {
@@ -45,7 +48,7 @@ interface ConvexQueryResponse<T> {
 // FETCH DUE EMPLOYEES FROM CONVEX
 // ---------------------------------------------------------------------------
 
-const fetchDueEmployees = (runtime: Runtime<Config>): DueEmployee[] => {
+const fetchDuePayments = (runtime: Runtime<Config>): DuePayment[] => {
   const http = new cre.capabilities.ConfidentialHTTPClient()
 
   const res = http.sendRequest(runtime, {
@@ -64,7 +67,7 @@ const fetchDueEmployees = (runtime: Runtime<Config>): DueEmployee[] => {
   }
 
   const text = new TextDecoder().decode(res.body)
-  const data: ConvexQueryResponse<DueEmployee[]> = JSON.parse(text)
+  const data: ConvexQueryResponse<DuePayment[]> = JSON.parse(text)
 
   if (data.status !== 'success') {
     throw new Error(`Convex error: ${JSON.stringify(data)}`)
@@ -79,12 +82,23 @@ const fetchDueEmployees = (runtime: Runtime<Config>): DueEmployee[] => {
 
 const markPaid = (
   runtime: Runtime<Config>,
-  employeeId: string,
+  payment: DuePayment,
   txHash: string,
-  amountCents: number,
   paidAt: number,
 ): void => {
   const http = new cre.capabilities.ConfidentialHTTPClient()
+
+  const args: Record<string, unknown> = {
+    employeeId: payment.employeeId,
+    compensationLineId: payment.compensationLineId,
+    walletAddress: payment.walletAddress,
+    txHash,
+    amountCents: payment.amountCents,
+    paidAt,
+  }
+  if (payment.compensationSplitId) {
+    args.compensationSplitId = payment.compensationSplitId
+  }
 
   const res = http.sendRequest(runtime, {
     request: {
@@ -93,17 +107,14 @@ const markPaid = (
       multiHeaders: {
         'Content-Type': { values: ['application/json'] },
       },
-      bodyString: JSON.stringify({
-        path: 'cre:markPaid',
-        args: { employeeId, txHash, amountCents, paidAt },
-      }),
+      bodyString: JSON.stringify({ path: 'cre:markPaid', args }),
     },
   }).result()
 
   if (res.statusCode !== 200) {
     runtime.log(
-      `WARNING: markPaid failed for employeeId=${employeeId} txHash=${txHash}. ` +
-      `HTTP ${res.statusCode}. nextPaymentDate not advanced — employee may be retried next cycle.`,
+      `WARNING: markPaid failed for employeeId=${payment.employeeId} txHash=${txHash}. ` +
+      `HTTP ${res.statusCode}. Payment may be retried next cycle.`,
     )
     return
   }
@@ -112,7 +123,7 @@ const markPaid = (
   const data = JSON.parse(text)
   if (data.status !== 'success') {
     runtime.log(
-      `WARNING: markPaid non-success for employeeId=${employeeId}: ${JSON.stringify(data)}`,
+      `WARNING: markPaid non-success for employeeId=${payment.employeeId}: ${JSON.stringify(data)}`,
     )
   }
 }
@@ -123,10 +134,10 @@ const markPaid = (
 
 const sendPayment = (
   runtime: Runtime<Config>,
-  employee: DueEmployee,
+  payment: DuePayment,
 ): string => {
   const { chainSelectorName, gasLimit } = runtime.config
-  const { payrollContractAddress, walletAddress, amountCents, _id, companyId } = employee
+  const { payrollContractAddress, walletAddress, amountCents, employeeId, companyId } = payment
 
   const network = getNetwork({ chainFamily: 'evm', chainSelectorName, isTestnet: true })
   if (!network) throw new Error(`Unknown network: ${chainSelectorName}`)
@@ -138,7 +149,7 @@ const sendPayment = (
 
   runtime.log(
     `Paying ${walletAddress} → $${(amountCents / 100).toFixed(2)} USDC (${amountWei} wei) ` +
-    `[employeeId: ${_id}] [companyId: ${companyId}] [contract: ${payrollContractAddress}]`,
+    `[employeeId: ${employeeId}] [companyId: ${companyId}] [contract: ${payrollContractAddress}]`,
   )
 
   const encoded = encodeAbiParameters(
@@ -170,28 +181,28 @@ const sendPayment = (
 // ---------------------------------------------------------------------------
 
 export const onCronTrigger = (runtime: Runtime<Config>, _payload: CronPayload): string => {
-  runtime.log('Payroll trigger fired — fetching due employees from Convex...')
+  runtime.log('Payroll trigger fired — fetching due payments from Convex...')
 
-  const employees = fetchDueEmployees(runtime)
-  runtime.log(`Found ${employees.length} due employee(s)`)
+  const payments = fetchDuePayments(runtime)
+  runtime.log(`Found ${payments.length} due payment(s)`)
 
-  if (employees.length === 0) {
-    return 'No due employees to pay today'
+  if (payments.length === 0) {
+    return 'No due payments today'
   }
 
   const results: string[] = []
   const failures: string[] = []
 
-  for (const employee of employees) {
+  for (const payment of payments) {
     try {
       const paidAt = Date.now()
-      const txHash = sendPayment(runtime, employee)
-      markPaid(runtime, employee._id, txHash, employee.amountCents, paidAt)
-      results.push(`${employee.walletAddress}:$${(employee.amountCents / 100).toFixed(2)}:${txHash}`)
+      const txHash = sendPayment(runtime, payment)
+      markPaid(runtime, payment, txHash, paidAt)
+      results.push(`${payment.walletAddress}:$${(payment.amountCents / 100).toFixed(2)}:${txHash}`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      runtime.log(`ERROR processing employeeId=${employee._id}: ${msg}`)
-      failures.push(`${employee._id}:${msg}`)
+      runtime.log(`ERROR processing employeeId=${payment.employeeId} (${payment.description}): ${msg}`)
+      failures.push(`${payment.employeeId}:${msg}`)
     }
   }
 
