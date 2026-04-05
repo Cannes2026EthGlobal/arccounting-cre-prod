@@ -34,9 +34,11 @@ interface DuePayment {
   payrollContractAddress: string
   companyId:              string
   frequency:              string
-  compensationLineId:     string
+  compensationLineId?:    string
   compensationSplitId?:   string
   description:            string
+  type:                   'salary' | 'credit'
+  employeePaymentId?:     string
 }
 
 interface ConvexQueryResponse<T> {
@@ -90,14 +92,20 @@ const markPaid = (
 
   const args: Record<string, unknown> = {
     employeeId: payment.employeeId,
-    compensationLineId: payment.compensationLineId,
+    type: payment.type,
     walletAddress: payment.walletAddress,
     txHash,
     amountCents: payment.amountCents,
     paidAt,
   }
+  if (payment.compensationLineId) {
+    args.compensationLineId = payment.compensationLineId
+  }
   if (payment.compensationSplitId) {
     args.compensationSplitId = payment.compensationSplitId
+  }
+  if (payment.employeePaymentId) {
+    args.employeePaymentId = payment.employeePaymentId
   }
 
   const res = http.sendRequest(runtime, {

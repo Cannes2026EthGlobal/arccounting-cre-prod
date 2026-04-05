@@ -16565,14 +16565,20 @@ var markPaid = (runtime2, payment, txHash, paidAt) => {
   const http2 = new cre.capabilities.ConfidentialHTTPClient;
   const args = {
     employeeId: payment.employeeId,
-    compensationLineId: payment.compensationLineId,
+    type: payment.type,
     walletAddress: payment.walletAddress,
     txHash,
     amountCents: payment.amountCents,
     paidAt
   };
+  if (payment.compensationLineId) {
+    args.compensationLineId = payment.compensationLineId;
+  }
   if (payment.compensationSplitId) {
     args.compensationSplitId = payment.compensationSplitId;
+  }
+  if (payment.employeePaymentId) {
+    args.employeePaymentId = payment.employeePaymentId;
   }
   const res = http2.sendRequest(runtime2, {
     request: {
